@@ -12,7 +12,10 @@
 #define PORT 8080
 #define BUFFER_SIZE 1024
 #define DURATION_SECONDS 30
-static volatile struct timespec last_rec_time;
+
+// Static global variable for last received time, now protected by a mutex
+static struct timespec last_rec_time;
+static pthread_mutex_t last_rec_time_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void *handle_client(void *socket_desc) {
     int sock = *(int*)socket_desc;
@@ -29,7 +32,11 @@ void *handle_client(void *socket_desc) {
         read_size = recv(sock, buffer, BUFFER_SIZE, 0);
 
         if (read_size > 0) {
-	    clock_gettime(CLOCK_MONOTONIC, &last_rec_time);	
+            // Protect write access to last_rec_time
+            pthread_mutex_lock(&last_rec_time_mutex);
+            clock_gettime(CLOCK_MONOTONIC, &last_rec_time);
+            pthread_mutex_unlock(&last_rec_time_mutex);
+
             printf("Server: Received from client %d: %s\n", sock, buffer);
             if (strcmp(buffer, "Hello") == 0) {
                 const char *response = "Hello";
@@ -80,7 +87,11 @@ int main() {
     }
     printf("Server: Bind done.\n");
 
+    // Initialize last_rec_time at startup, also protected
+    pthread_mutex_lock(&last_rec_time_mutex);
     clock_gettime(CLOCK_MONOTONIC, &last_rec_time);
+    pthread_mutex_unlock(&last_rec_time_mutex);
+
     listen(socket_desc, 101);
     printf("Server: Waiting for incoming connections on port %d...\n", PORT);
 
@@ -91,9 +102,19 @@ int main() {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 // No incoming connections, continue
                 usleep(100000); // Sleep for 100ms
-		clock_gettime(CLOCK_MONOTONIC, &current_time);
-		if((current_time.tv_sec - last_rec_time.tv_sec) >= DURATION_SECONDS)
-			break;
+
+                // Protect read access to last_rec_time
+                pthread_mutex_lock(&last_rec_time_mutex);
+                clock_gettime(CLOCK_MONOTONIC, &current_time);
+                // Create a local copy to work with outside the lock if needed,
+                // but for simple comparison, doing it under the lock is fine.
+                struct timespec last_time_copy = last_rec_time;
+                pthread_mutex_unlock(&last_rec_time_mutex);
+
+                if((current_time.tv_sec - last_time_copy.tv_sec) >= DURATION_SECONDS) {
+                    printf("Server: No activity for %d seconds. Shutting down.\n", DURATION_SECONDS);
+                    break;
+                }
                 continue;
             } else {
                 perror("Server: accept failed");
@@ -109,14 +130,23 @@ int main() {
 
         if (pthread_create(&client_thread, NULL, handle_client, (void*) new_sock) < 0) {
             perror("Server: Could not create thread");
+            // If thread creation fails, make sure to close the client_sock and free memory
+            close(client_sock);
+            free(new_sock);
             return 1;
         }
-	clock_gettime(CLOCK_MONOTONIC, &current_time);
+        // No need to update last_rec_time here, as it's updated in handle_client on first receive.
+        // If you want to update it on *connection* rather than *receive*, you'd add:
+        // pthread_mutex_lock(&last_rec_time_mutex);
+        // clock_gettime(CLOCK_MONOTONIC, &last_rec_time);
+        // pthread_mutex_unlock(&last_rec_time_mutex);
 
         pthread_detach(client_thread); // Detach thread so resources are freed automatically
     }
 
     printf("Server: Shutting down.\n");
     close(socket_desc);
+    // Destroy the mutex at the end of the program
+    pthread_mutex_destroy(&last_rec_time_mutex);
     return 0;
 }
